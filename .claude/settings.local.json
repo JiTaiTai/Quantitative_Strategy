@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pip install *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-ChildItem *)"
+    ]
+  }
+}
