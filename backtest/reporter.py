@@ -30,6 +30,9 @@ def generate_report(trades: List[Trade], equity_curve: List[dict],
 
     final_equity = eq_df["equity"].iloc[-1]
     total_return = (final_equity - initial_cash) / initial_cash
+    exposure = eq_df["position_value"] / eq_df["equity"].replace(0, np.nan)
+    avg_exposure = exposure.fillna(0).mean()
+    max_exposure = exposure.fillna(0).max()
 
     # 年化收益率
     days = (eq_df.index[-1] - eq_df.index[0]).days
@@ -92,6 +95,8 @@ def generate_report(trades: List[Trade], equity_curve: List[dict],
         "平均盈利": avg_win,
         "平均亏损": avg_loss,
         "盈亏比": profit_factor,
+        "平均仓位": avg_exposure,
+        "最高仓位": max_exposure,
         "持仓中": len(open_trades),
         "事件统计": event_stats,
     }
@@ -116,6 +121,8 @@ def print_report(report: dict):
     print(f"  平均盈利      : {report['平均盈利']:>11,.0f} 元")
     print(f"  平均亏损      : {report['平均亏损']:>11,.0f} 元")
     print(f"  盈亏比        : {report['盈亏比']:>11.2f}")
+    print(f"  平均仓位      : {report['平均仓位']:>11.1%}")
+    print(f"  最高仓位      : {report['最高仓位']:>11.1%}")
     print(f"  持仓中        : {report['持仓中']:>11} 笔")
     print("-" * 60)
 

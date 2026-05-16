@@ -20,19 +20,48 @@ def main():
     CONFIG = {
         # 资金
         "initial_cash": 200_000,
-        "position_per_trade": 20_000,
+        "position_per_trade": 40_000,
 
         # 风控
-        "stop_loss": -0.05,
-        "take_profit": 0.08,
+        "stop_loss": -0.08,
+        "take_profit": 10.0,
         "daily_loss_limit": -5000,
         "weekly_loss_limit": -12000,
         "consecutive_loss_limit": 5,
+        "loss_cooldown_days": 10,
         "max_holdings": 5,
-        "max_daily_trades": 3,
+        "max_daily_trades": 5,
+        "max_sector_holdings": 3,
         "cooldown_days": 5,
+        "max_hold_days": 180,
+        "min_hold_days": 3,
+        "trailing_drawdown": 0.20,
+        "profit_exit_ma": "ma60",
+        "min_position_cash": 10_000,
+        "regime_exposure": {
+            "bull": 0.95,
+            "neutral": 0.65,
+            "bear": 0.30,
+        },
+
+        # 股票宇宙：只允许 A 股主板股票。
+        # sh = 沪市主板 60xxxx；sz = 深市主板 00xxxx。
+        # 不允许创业板 30xxxx、科创板 68xxxx、北交所 43/83/87/88xxxx。
+        "allowed_boards": ["sh", "sz"],
+        "exclude_st": True,
+        "max_universe_size": 120,
+        "max_new_downloads_per_run": 30,
+        "download_delay": 0.1,
+        "min_history_days": 180,
+
+        # 执行约束（日线信号 -> 次日开盘成交）
+        "buy_slippage": 0.001,
+        "sell_slippage": 0.001,
+        "limit_buffer": 0.002,
+        "order_timeout_days": 3,
 
         # 事件参数
+        "enabled_events": ["趋势底仓", "趋势启动", "放量突破"],
         "volume_mult": 2.0,
         "gap_pct": 0.02,
         "ma_short": 5,
@@ -48,14 +77,14 @@ def main():
     print(f"  回测区间: {START_DATE} ~ {END_DATE}")
     print(f"  数据频率: 日线")
     print(f"  初始资金: {CONFIG['initial_cash']:,} 元")
-    print(f"  说明: 分钟线 API 暂不可用，日线验证策略框架")
-    print(f"        QMT 接入后替换为实时数据源")
+    print(f"  说明: 收盘生成信号，次日开盘按滑点/涨跌停/T+1约束成交")
+    print(f"        当前仅启用: {', '.join(CONFIG['enabled_events'])}")
     print("=" * 60)
     print()
 
     # ==================== 1. 加载数据 ====================
     print("[1/3] 获取行情数据...")
-    data = load_stock_pool(START_DATE, END_DATE)
+    data = load_stock_pool(START_DATE, END_DATE, CONFIG)
 
     if not data:
         print("\n[错误] 没有获取到任何数据。")

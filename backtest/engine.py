@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
-from .data_loader import STOCK_POOL, get_limit_price
+from .data_loader import get_limit_price, get_stock_info
 
 
 # ============================================================
@@ -39,6 +39,17 @@ class Trade:
     holding_days: int = 0
 
 
+@dataclass
+class PendingOrder:
+    code: str
+    name: str
+    event: str
+    signal_date: pd.Timestamp
+    signal_day_index: int
+    side: str = "buy"
+    reason: str = ""
+
+
 # ============================================================
 # 事件检测器（日线适配版）
 # ============================================================
@@ -57,10 +68,15 @@ class EventDetector:
 
     def __init__(self, config: dict = None):
         self.config = config or {}
-        self.vol_mult = config.get("volume_mult", 2.0)
-        self.gap_pct = config.get("gap_pct", 0.02)
-        self.ma_short = config.get("ma_short", 5)
-        self.ma_long = config.get("ma_long", 20)
+        self.vol_mult = self.config.get("volume_mult", 2.0)
+        self.gap_pct = self.config.get("gap_pct", 0.02)
+        self.ma_short = self.config.get("ma_short", 5)
+        self.ma_long = self.config.get("ma_long", 20)
+        enabled_events = self.config.get("enabled_events")
+        self.enabled_events = set(enabled_events) if enabled_events else None
+
+    def _enabled(self, event_name: str) -> bool:
+        return self.enabled_events is None or event_name in self.enabled_events
 
     # -------- 事件 1：跌停板翘板 --------
     def detect_limit_down_reversal(
@@ -288,21 +304,62 @@ class EventDetector:
 
         return True
 
+    # -------- 事件 7：趋势底仓（牛市持有型） --------
+    def detect_trend_position(
+        self, code: str, bar: pd.Series, hist: pd.DataFrame
+    ) -> bool:
+        """
+        日线版：中期趋势已经走强，用于建立底仓。
+        条件：
+        1. 收盘 > MA20 > MA60
+        2. 收盘接近 20 日新高
+        3. 20 日涨幅为正且不过热
+        4. 成交量不低于 20 日均量的 80%
+        """
+        if len(hist) < 80:
+            return False
+
+        closes = hist["close"]
+        ma20 = closes.rolling(20).mean()
+        ma60 = closes.rolling(60).mean()
+        if np.isnan(ma20.iloc[-1]) or np.isnan(ma60.iloc[-1]):
+            return False
+
+        if not (bar["close"] > ma20.iloc[-1] > ma60.iloc[-1]):
+            return False
+
+        high_20 = hist["high"].tail(20).max()
+        if high_20 <= 0 or bar["close"] < high_20 * 0.97:
+            return False
+
+        start_price = closes.iloc[-20]
+        ret_20 = (bar["close"] - start_price) / start_price if start_price > 0 else 0
+        if ret_20 < 0.04 or ret_20 > 0.45:
+            return False
+
+        avg_vol = hist["volume"].tail(20).mean()
+        if avg_vol <= 0 or bar["volume"] < avg_vol * 0.8:
+            return False
+
+        return True
+
     def detect_all(self, code: str, bar: pd.Series, hist: pd.DataFrame) -> List[str]:
         """运行所有事件检测，返回触发的事件名列表"""
         events = []
-        if self.detect_limit_down_reversal(code, bar, hist):
+        if self._enabled("跌停翘板") and self.detect_limit_down_reversal(code, bar, hist):
             events.append("跌停翘板")
-        if self.detect_sustained_inflow(code, bar, hist):
+        if self._enabled("持续吸筹") and self.detect_sustained_inflow(code, bar, hist):
             events.append("持续吸筹")
-        if self.detect_volume_breakout(code, bar, hist):
+        if self._enabled("放量突破") and self.detect_volume_breakout(code, bar, hist):
             events.append("放量突破")
-        if self.detect_limit_up_seal(code, bar, hist):
+        if self._enabled("涨停封板") and self.detect_limit_up_seal(code, bar, hist):
             events.append("涨停封板")
-        if self.detect_opening_gap(code, bar, hist):
+        if self._enabled("开盘跳空") and self.detect_opening_gap(code, bar, hist):
             events.append("开盘跳空")
-        if self.detect_trend_launch(code, bar, hist):
+        if self._enabled("趋势启动") and self.detect_trend_launch(code, bar, hist):
             events.append("趋势启动")
+        if self._enabled("趋势底仓") and self.detect_trend_position(code, bar, hist):
+            events.append("趋势底仓")
         return events
 
 
@@ -313,15 +370,17 @@ class EventDetector:
 class RiskManager:
     def __init__(self, config: dict = None):
         self.config = config or {}
-        self.stop_loss = config.get("stop_loss", -0.05)
-        self.take_profit = config.get("take_profit", 0.08)
-        self.daily_loss_limit = config.get("daily_loss_limit", -5000)
-        self.weekly_loss_limit = config.get("weekly_loss_limit", -12000)
-        self.consecutive_loss_limit = config.get("consecutive_loss_limit", 5)
-        self.max_holdings = config.get("max_holdings", 5)
-        self.max_daily_trades = config.get("max_daily_trades", 3)
-        self.position_per_trade = config.get("position_per_trade", 20000)
-        self.cooldown_days = config.get("cooldown_days", 5)
+        self.stop_loss = self.config.get("stop_loss", -0.05)
+        self.take_profit = self.config.get("take_profit", 0.08)
+        self.daily_loss_limit = self.config.get("daily_loss_limit", -5000)
+        self.weekly_loss_limit = self.config.get("weekly_loss_limit", -12000)
+        self.consecutive_loss_limit = self.config.get("consecutive_loss_limit", 5)
+        self.max_holdings = self.config.get("max_holdings", 5)
+        self.max_daily_trades = self.config.get("max_daily_trades", 3)
+        self.max_sector_holdings = self.config.get("max_sector_holdings", 2)
+        self.position_per_trade = self.config.get("position_per_trade", 20000)
+        self.cooldown_days = self.config.get("cooldown_days", 5)
+        self.loss_cooldown_days = self.config.get("loss_cooldown_days", 10)
 
         # 运行时状态
         self.daily_pnl = 0.0
@@ -332,8 +391,12 @@ class RiskManager:
         self.current_week = None
         self.blacklist: Dict[str, pd.Timestamp] = {}
         self.last_sell_date: Dict[str, pd.Timestamp] = {}
+        self.loss_cooldown_until: Optional[pd.Timestamp] = None
 
     def start_day(self, date: pd.Timestamp):
+        if self.loss_cooldown_until is not None and date >= self.loss_cooldown_until:
+            self.consecutive_losses = 0
+            self.loss_cooldown_until = None
         if self.current_date != date:
             self.daily_pnl = 0.0
             self.daily_trade_count = 0
@@ -343,16 +406,39 @@ class RiskManager:
             self.weekly_pnl = 0.0
             self.current_week = week
 
-    def can_open(self, code: str, current_date: pd.Timestamp) -> Tuple[bool, str]:
+    def can_open(
+        self,
+        code: str,
+        current_date: pd.Timestamp,
+        current_holdings: int = 0,
+        pending_orders: int = 0,
+        current_codes: List[str] = None,
+        pending_codes: List[str] = None,
+        check_daily_trade_count: bool = True,
+    ) -> Tuple[bool, str]:
         """检查是否允许开仓"""
-        if self.daily_pnl < self.daily_loss_limit:
+        projected_holdings = current_holdings + pending_orders
+        if projected_holdings >= self.max_holdings:
+            return False, f"持仓数量已达上限 ({projected_holdings}/{self.max_holdings})"
+        if self.daily_pnl <= self.daily_loss_limit:
             return False, f"日内亏损熔断 ({self.daily_pnl:.0f})"
-        if self.weekly_pnl < self.weekly_loss_limit:
+        if self.weekly_pnl <= self.weekly_loss_limit:
             return False, f"本周亏损熔断 ({self.weekly_pnl:.0f})"
         if self.consecutive_losses >= self.consecutive_loss_limit:
+            if self.loss_cooldown_until is not None:
+                return False, f"连续亏损冷却至 {self.loss_cooldown_until.date()}"
             return False, f"连续亏损 {self.consecutive_losses} 笔"
-        if self.daily_trade_count >= self.max_daily_trades:
+        if check_daily_trade_count and self.daily_trade_count >= self.max_daily_trades:
             return False, "今日交易次数已满"
+        if self.max_sector_holdings is not None:
+            sector = get_stock_info(code).get("sector")
+            tracked_codes = (current_codes or []) + (pending_codes or [])
+            same_sector = sum(
+                1 for c in tracked_codes
+                if get_stock_info(c).get("sector") == sector
+            )
+            if sector and same_sector >= self.max_sector_holdings:
+                return False, f"{sector} 行业持仓已达上限"
         if code in self.blacklist and current_date < self.blacklist[code]:
             return False, "黑名单中"
         if code in self.last_sell_date:
@@ -369,8 +455,11 @@ class RiskManager:
         self.weekly_pnl += trade.pnl_amount
         if trade.pnl_amount < 0:
             self.consecutive_losses += 1
+            if self.consecutive_losses >= self.consecutive_loss_limit and trade.sell_date is not None:
+                self.loss_cooldown_until = trade.sell_date + pd.Timedelta(days=self.loss_cooldown_days)
         else:
             self.consecutive_losses = 0
+            self.loss_cooldown_until = None
 
     def add_blacklist(self, code: str, until: pd.Timestamp):
         self.blacklist[code] = until
@@ -388,10 +477,23 @@ class Portfolio:
         self.trades: List[Trade] = []
         self.equity_curve: List[dict] = []
 
-    def buy(self, code: str, name: str, event: str, price: float, date: pd.Timestamp,
-            risk_mgr: RiskManager = None) -> Optional[Trade]:
-        """买入。信号日收盘触发，次日开盘执行。用当日收盘价近似次日开盘价。"""
-        amount_per = risk_mgr.position_per_trade if risk_mgr else 20000
+    def buy(
+        self,
+        code: str,
+        name: str,
+        event: str,
+        price: float,
+        date: pd.Timestamp,
+        risk_mgr: RiskManager = None,
+        trade_day_index: Optional[int] = None,
+        amount_override: Optional[float] = None,
+    ) -> Optional[Trade]:
+        """买入。信号日收盘触发，次日开盘执行。"""
+        if code in self.positions or price <= 0:
+            return None
+        amount_per = amount_override if amount_override is not None else (
+            risk_mgr.position_per_trade if risk_mgr else 20000
+        )
         amount = min(amount_per, self.cash * 0.95)  # 留 5% 现金
 
         shares = int(amount / price / 100) * 100
@@ -411,6 +513,7 @@ class Portfolio:
             "avg_cost": price,
             "buy_date": date,
             "buy_price": price,
+            "buy_day_index": trade_day_index,
             "peak_price": price,
             "event": event,
         }
@@ -420,44 +523,55 @@ class Portfolio:
         self.trades.append(trade)
         return trade
 
-    def sell(self, code: str, price: float, date: pd.Timestamp, reason: str):
+    def sell(
+        self,
+        code: str,
+        price: float,
+        date: pd.Timestamp,
+        reason: str,
+        trade_day_index: Optional[int] = None,
+    ) -> Optional[Trade]:
         if code not in self.positions:
-            return
+            return None
         pos = self.positions.pop(code)
         shares = pos["shares"]
         proceeds = shares * price * (1 - 0.0003 - 0.001)  # 佣金 + 印花税
+        buy_cost = shares * pos["avg_cost"] * (1 + 0.0003)
 
-        for trade in self.trades:
+        closed_trade = None
+        for trade in reversed(self.trades):
             if trade.code == code and trade.sell_date is None:
                 trade.sell_date = date
                 trade.sell_price = price
                 trade.sell_reason = reason
-                trade.pnl_pct = (price - pos["avg_cost"]) / pos["avg_cost"]
-                trade.pnl_amount = (price - pos["avg_cost"]) * shares
-                buy_fee = pos["avg_cost"] * shares * 0.0003
-                sell_fee = price * shares * (0.0003 + 0.001)
-                trade.pnl_amount -= (buy_fee + sell_fee)
-                trade.holding_days = (date - pos["buy_date"]).days
+                trade.pnl_amount = proceeds - buy_cost
+                trade.pnl_pct = trade.pnl_amount / buy_cost if buy_cost > 0 else 0
+                if trade_day_index is not None and pos.get("buy_day_index") is not None:
+                    trade.holding_days = trade_day_index - pos["buy_day_index"]
+                else:
+                    trade.holding_days = (date - pos["buy_date"]).days
+                closed_trade = trade
                 break
 
         self.cash += proceeds
+        return closed_trade
 
     def update_peak(self, code: str, price: float):
         if code in self.positions and price > self.positions[code]["peak_price"]:
             self.positions[code]["peak_price"] = price
 
-    def total_value(self, prices: Dict[str, float]) -> float:
-        pos_value = sum(
+    def position_value(self, prices: Dict[str, float]) -> float:
+        return sum(
             pos["shares"] * prices.get(code, pos["avg_cost"])
             for code, pos in self.positions.items()
         )
+
+    def total_value(self, prices: Dict[str, float]) -> float:
+        pos_value = self.position_value(prices)
         return self.cash + pos_value
 
     def record_equity(self, date: pd.Timestamp, prices: Dict[str, float]):
-        pos_value = sum(
-            pos["shares"] * prices.get(code, pos["avg_cost"])
-            for code, pos in self.positions.items()
-        )
+        pos_value = self.position_value(prices)
         self.equity_curve.append({
             "time": date,
             "equity": self.cash + pos_value,
@@ -474,16 +588,220 @@ class BacktestEngine:
     def __init__(self, data: dict, config: dict = None):
         self.data = data
         self.config = config or {}
-        self.detector = EventDetector(config)
-        self.risk_mgr = RiskManager(config)
-        self.portfolio = Portfolio(config.get("initial_cash", 200_000))
+        self.detector = EventDetector(self.config)
+        self.risk_mgr = RiskManager(self.config)
+        self.portfolio = Portfolio(self.config.get("initial_cash", 200_000))
+        self.pending_buys: Dict[str, PendingOrder] = {}
+        self.pending_sells: Dict[str, PendingOrder] = {}
+        self.buy_slippage = self.config.get("buy_slippage", 0.001)
+        self.sell_slippage = self.config.get("sell_slippage", 0.001)
+        self.limit_buffer = self.config.get("limit_buffer", 0.002)
+        self.max_hold_days = self.config.get("max_hold_days", 10)
+        self.min_hold_days = self.config.get("min_hold_days", 2)
+        self.trailing_drawdown = self.config.get("trailing_drawdown", 0.12)
+        self.profit_exit_ma = self.config.get("profit_exit_ma", "ma20")
+        self.order_timeout_days = self.config.get("order_timeout_days", 3)
+        self.min_position_cash = self.config.get("min_position_cash", 10_000)
+        self.regime_exposure = self.config.get(
+            "regime_exposure",
+            {"bull": 0.95, "neutral": 0.65, "bear": 0.30},
+        )
         self._build_timeline()
+        self._build_market_proxy()
 
     def _build_timeline(self):
         all_dates = set()
         for code, df in self.data.items():
             all_dates.update(df.index)
         self.timeline = sorted(all_dates)
+
+    def _build_market_proxy(self):
+        normalized = []
+        for code, df in self.data.items():
+            if df.empty or "close" not in df.columns:
+                continue
+            close = df["close"].dropna()
+            if close.empty or close.iloc[0] <= 0:
+                continue
+            normalized.append((close / close.iloc[0]).rename(code))
+
+        if not normalized:
+            self.market_proxy = pd.DataFrame()
+            return
+
+        proxy = pd.concat(normalized, axis=1).mean(axis=1).sort_index()
+        self.market_proxy = pd.DataFrame({
+            "close": proxy,
+            "ma20": proxy.rolling(20).mean(),
+            "ma60": proxy.rolling(60).mean(),
+        })
+
+    def _market_regime(self, date: pd.Timestamp) -> str:
+        if self.market_proxy.empty:
+            return "neutral"
+        rows = self.market_proxy[self.market_proxy.index <= date]
+        if rows.empty:
+            return "neutral"
+        row = rows.iloc[-1]
+        if np.isnan(row["ma20"]) or np.isnan(row["ma60"]):
+            return "neutral"
+        if row["close"] >= row["ma20"] >= row["ma60"]:
+            return "bull"
+        if row["close"] >= row["ma60"]:
+            return "neutral"
+        return "bear"
+
+    def _max_exposure(self, date: pd.Timestamp) -> float:
+        regime = self._market_regime(date)
+        return self.regime_exposure.get(regime, self.regime_exposure.get("neutral", 0.65))
+
+    def _prices_at(self, date: pd.Timestamp, field: str) -> Dict[str, float]:
+        prices = {}
+        for code, df in self.data.items():
+            if date in df.index and field in df.columns:
+                prices[code] = df.loc[date, field]
+        return prices
+
+    def _limit_prices(self, code: str, hist: pd.DataFrame) -> Tuple[Optional[float], Optional[float]]:
+        if len(hist) < 2:
+            return None, None
+        prev_close = hist.iloc[-2]["close"]
+        return get_limit_price(code, prev_close)
+
+    def _buy_blocked_by_limit(self, code: str, bar: pd.Series, hist: pd.DataFrame) -> bool:
+        limit_down, limit_up = self._limit_prices(code, hist)
+        if limit_down is None or limit_up is None:
+            return False
+        open_price = bar["open"]
+        return (
+            open_price <= limit_down * (1 + self.limit_buffer)
+            or open_price >= limit_up * (1 - self.limit_buffer)
+        )
+
+    def _sell_blocked_by_limit(self, code: str, bar: pd.Series, hist: pd.DataFrame) -> bool:
+        limit_down, _ = self._limit_prices(code, hist)
+        if limit_down is None:
+            return False
+        return bar["open"] <= limit_down * (1 + self.limit_buffer)
+
+    def _execute_sell(
+        self,
+        code: str,
+        price: float,
+        date: pd.Timestamp,
+        reason: str,
+        trade_day_index: int,
+    ) -> Optional[Trade]:
+        trade = self.portfolio.sell(code, price, date, reason, trade_day_index=trade_day_index)
+        if trade is None:
+            return None
+        self.risk_mgr.record_sell(code, date)
+        self.risk_mgr.record_trade_close(trade)
+        return trade
+
+    def _execute_pending_sells(self, date: pd.Timestamp, trade_day_index: int):
+        for code, order in list(self.pending_sells.items()):
+            if trade_day_index <= order.signal_day_index:
+                continue
+            if code not in self.portfolio.positions:
+                self.pending_sells.pop(code, None)
+                continue
+
+            df = self.data.get(code)
+            if df is None or date not in df.index:
+                continue
+
+            hist = df[df.index <= date]
+            bar = df.loc[date]
+            if self._sell_blocked_by_limit(code, bar, hist):
+                continue
+
+            sell_price = bar["open"] * (1 - self.sell_slippage)
+            self._execute_sell(code, sell_price, date, order.reason, trade_day_index)
+            self.pending_sells.pop(code, None)
+
+    def _execute_pending_buys(
+        self,
+        date: pd.Timestamp,
+        trade_day_index: int,
+        open_prices: Dict[str, float],
+    ):
+        for code, order in list(self.pending_buys.items()):
+            if trade_day_index <= order.signal_day_index:
+                continue
+
+            df = self.data.get(code)
+            if df is None or date not in df.index:
+                if (date - order.signal_date).days > self.order_timeout_days:
+                    self.pending_buys.pop(code, None)
+                continue
+
+            hist = df[df.index <= date]
+            bar = df.loc[date]
+            stale = (date - order.signal_date).days > self.order_timeout_days
+            if stale or code in self.portfolio.positions or self._buy_blocked_by_limit(code, bar, hist):
+                self.pending_buys.pop(code, None)
+                continue
+
+            can_open, _ = self.risk_mgr.can_open(
+                code,
+                date,
+                current_holdings=len(self.portfolio.positions),
+                pending_orders=0,
+                current_codes=list(self.portfolio.positions.keys()),
+                pending_codes=[],
+            )
+            if not can_open:
+                self.pending_buys.pop(code, None)
+                continue
+
+            portfolio_value = self.portfolio.total_value(open_prices)
+            position_value = self.portfolio.position_value(open_prices)
+            exposure_room = portfolio_value * self._max_exposure(order.signal_date) - position_value
+            amount = min(self.risk_mgr.position_per_trade, exposure_room)
+            if amount < self.min_position_cash:
+                self.pending_buys.pop(code, None)
+                continue
+
+            buy_price = bar["open"] * (1 + self.buy_slippage)
+            trade = self.portfolio.buy(
+                code,
+                order.name,
+                order.event,
+                buy_price,
+                date,
+                risk_mgr=self.risk_mgr,
+                trade_day_index=trade_day_index,
+                amount_override=amount,
+            )
+            if trade is not None:
+                self.risk_mgr.daily_trade_count += 1
+            self.pending_buys.pop(code, None)
+
+    def _queue_sell(self, code: str, date: pd.Timestamp, trade_day_index: int, reason: str):
+        if code in self.pending_sells:
+            return
+        pos = self.portfolio.positions.get(code)
+        if pos is None:
+            return
+        self.pending_sells[code] = PendingOrder(
+            code=code,
+            name=get_stock_info(code)["name"],
+            event=pos["event"],
+            signal_date=date,
+            signal_day_index=trade_day_index,
+            side="sell",
+            reason=reason,
+        )
+
+    def _queue_buy(self, code: str, date: pd.Timestamp, trade_day_index: int, event: str):
+        self.pending_buys[code] = PendingOrder(
+            code=code,
+            name=get_stock_info(code)["name"],
+            event=event,
+            signal_date=date,
+            signal_day_index=trade_day_index,
+        )
 
     def run(self):
         print(f"回测时间线: {self.timeline[0].date()} ~ {self.timeline[-1].date()}")
@@ -499,6 +817,10 @@ class BacktestEngine:
 
             self.risk_mgr.start_day(date)
 
+            open_prices = self._prices_at(date, "open")
+            self._execute_pending_sells(date, i)
+            self._execute_pending_buys(date, i, open_prices)
+
             # 收集当日价格
             prices = {}
             for code in self.data:
@@ -506,7 +828,7 @@ class BacktestEngine:
                 if date in df.index:
                     prices[code] = df.loc[date, "close"]
 
-            # ---- 检查持仓的止损止盈 ----
+            # ---- 收盘后检查持仓，生成次日开盘卖出委托 ----
             for code in list(self.portfolio.positions.keys()):
                 if code not in prices:
                     continue
@@ -514,39 +836,56 @@ class BacktestEngine:
                 price = prices[code]
                 self.portfolio.update_peak(code, price)
 
+                buy_day_index = pos.get("buy_day_index")
+                if buy_day_index is not None and i <= buy_day_index:
+                    continue
+
                 pnl = (price - pos["avg_cost"]) / pos["avg_cost"]
 
                 # 止损
                 if pnl <= self.risk_mgr.stop_loss:
-                    self.portfolio.sell(code, price, date, "止损")
-                    self.risk_mgr.record_sell(code, date)
-                    continue
-
-                # 止盈
-                if pnl >= self.risk_mgr.take_profit:
-                    self.portfolio.sell(code, price, date, "止盈")
-                    self.risk_mgr.record_sell(code, date)
+                    self._queue_sell(code, date, i, "止损")
                     continue
 
                 # 回撤止盈
                 peak = pos["peak_price"]
                 dd = (price - peak) / peak if peak > 0 else 0
-                if dd <= -0.08:
-                    self.portfolio.sell(code, price, date, "回撤止盈")
-                    self.risk_mgr.record_sell(code, date)
+                if dd <= -self.trailing_drawdown:
+                    self._queue_sell(code, date, i, "回撤止盈")
                     continue
 
-                # T+1 后才可卖，但日线每个 bar 都是一天，所以 T+1 自动满足
+                holding = i - buy_day_index if buy_day_index is not None else (date - pos["buy_date"]).days
+                if holding < self.min_hold_days:
+                    continue
 
-                # 时限止盈：持有 10 个交易日
-                holding = (date - pos["buy_date"]).days
-                if holding >= 10:
-                    self.portfolio.sell(code, price, date, "时限到期")
-                    self.risk_mgr.record_sell(code, date)
+                df = self.data.get(code)
+                hist = df[df.index <= date] if df is not None and date in df.index else pd.DataFrame()
+                if len(hist) >= 60:
+                    ma20 = hist["close"].rolling(20).mean().iloc[-1]
+                    ma60 = hist["close"].rolling(60).mean().iloc[-1]
+                    if not np.isnan(ma60) and price < ma60:
+                        self._queue_sell(code, date, i, "跌破MA60")
+                        continue
+                    if (
+                        self.profit_exit_ma == "ma20"
+                        and not np.isnan(ma20)
+                        and pnl > 0
+                        and price < ma20
+                    ):
+                        self._queue_sell(code, date, i, "跌破MA20止盈")
+                        continue
+
+                # 牛市持有允许吃主升浪，极端盈利才主动兑现。
+                if pnl >= self.risk_mgr.take_profit:
+                    self._queue_sell(code, date, i, "趋势止盈")
+                    continue
+
+                if holding >= self.max_hold_days:
+                    self._queue_sell(code, date, i, "时限到期")
 
             # ---- 事件检测 ----
             for code in self.data:
-                if code in self.portfolio.positions:
+                if code in self.portfolio.positions or code in self.pending_buys or code in self.pending_sells:
                     continue
 
                 df = self.data[code]
@@ -556,7 +895,7 @@ class BacktestEngine:
                 bar = df.loc[date]
                 hist = df[df.index <= date]
 
-                # 跌停/涨停无法买入
+                # 收盘触发信号时，先过滤明显不可交易的涨跌停状态。
                 if len(hist) >= 2:
                     prev_close = hist.iloc[-2]["close"]
                     ld, lu = get_limit_price(code, prev_close)
@@ -564,7 +903,16 @@ class BacktestEngine:
                         continue
 
                 # 风控
-                can_open, _ = self.risk_mgr.can_open(code, date)
+                pending_codes = list(self.pending_buys.keys())
+                can_open, _ = self.risk_mgr.can_open(
+                    code,
+                    date,
+                    current_holdings=len(self.portfolio.positions),
+                    pending_orders=len(self.pending_buys),
+                    current_codes=list(self.portfolio.positions.keys()),
+                    pending_codes=pending_codes,
+                    check_daily_trade_count=False,
+                )
                 if not can_open:
                     continue
 
@@ -573,12 +921,8 @@ class BacktestEngine:
                 if not events:
                     continue
 
-                # 触发买入
-                self.portfolio.buy(
-                    code, STOCK_POOL[code]["name"], events[0],
-                    bar["close"], date, risk_mgr=self.risk_mgr
-                )
-                self.risk_mgr.daily_trade_count += 1
+                # 收盘只生成委托，下一交易日开盘再按交易约束尝试成交。
+                self._queue_buy(code, date, i, events[0])
 
             # 每日记录权益曲线
             self.portfolio.record_equity(date, prices)
@@ -591,7 +935,7 @@ class BacktestEngine:
                 final_prices[code] = df.iloc[-1]["close"]
         for code in list(self.portfolio.positions.keys()):
             price = final_prices.get(code, self.portfolio.positions[code]["avg_cost"])
-            self.portfolio.sell(code, price, self.timeline[-1], "回测结束")
+            self._execute_sell(code, price, self.timeline[-1], "回测结束", len(self.timeline) - 1)
         self.portfolio.record_equity(self.timeline[-1], final_prices)
 
         print("\n回测完成。\n")
